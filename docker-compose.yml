@@ -1,0 +1,19 @@
+services:
+  ai-qa-agent-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - PYTHONUNBUFFERED=1
+      - LLM_ENABLED=${LLM_ENABLED:-false}
+      # Inside a container, "localhost" is the container itself; this reaches Ollama on your machine.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
