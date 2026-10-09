@@ -1,0 +1,1773 @@
+
+================================================================================
+FOLDER STRUCTURE
+================================================================================
+
+ROOT: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests
+tests/
+    __init__.py
+    conftest.py
+    fakes.py
+    e2e/
+        test_api_e2e.py
+    integration/
+        test_api_run_lifecycle.py
+        test_api_runner.py
+    unit/
+        test_artifact_tools.py
+        test_demo_api.py
+        test_domain_agent.py
+        test_failure_analysis_agent.py
+        test_llm_base.py
+        test_planning_and_reporting_agents.py
+        test_requirement_agent.py
+        test_review_regressions.py
+        test_test_design_agent.py
+        test_traceability_evaluator.py
+        test_workflow.py
+
+ROOT: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation
+evaluation/
+    __init__.py
+    run_evaluation.py
+    datasets/
+        baseline.json
+        scenarios.json
+    evaluators/
+        __init__.py
+        quality.py
+        traceability.py
+    reports/
+        latest.json
+
+================================================================================
+SOURCE CODE
+================================================================================
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\__init__.py
+================================================================================
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\conftest.py
+================================================================================
+# File: tests/conftest.py
+# Description: Defines shared pytest fixtures for application and agent tests.
+# Author Name: Debleena Nandy
+# Date: 07-10-2026
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import socket
+from contextlib import contextmanager
+from pathlib import Path
+from threading import Thread
+from time import monotonic, sleep
+from typing import Any, Callable, Iterator, List, Optional, Set
+
+import pytest
+import uvicorn
+from fastapi.testclient import TestClient
+
+from agents.test_design_agent.agent import REQUIRED_TYPES
+from api.main import app, get_llm, get_run_repository
+from config.settings import settings
+from core.models.scenario import ScenarioDraft, ScenarioDraftSet
+from core.persistence.run_repository import RunRepository
+from demo_target.main import create_demo_app
+from tests.fakes import DemoFakeLLM
+
+UrlIterator = Iterator[str]
+ClientIterator = Iterator[TestClient]
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Tests never depend on a developer's .env, Ollama, or a real target."""
+    values = {
+        "qa_api_base_url": "", "qa_approval_token": "", "browser_enabled": False,
+        "analyze_requires_token": False, "rule_based_fallback": False, "llm_check_on_startup": False,
+        "rag_use_embeddings": False, "llm_max_retries": 1, "qa_artifacts_dir": str(tmp_path / "artifacts"),
+        "knowledge_dir": "tools/rag_tools/corpus",
+    }
+    for name, value in values.items():
+        monkeypatch.setattr(settings, name, value)
+
+
+@pytest.fixture
+def fake_llm() -> DemoFakeLLM:
+    return DemoFakeLLM()
+
+
+@pytest.fixture
+def client(fake_llm: DemoFakeLLM, tmp_path: Path) -> ClientIterator:
+    app.dependency_overrides[get_llm] = lambda: fake_llm
+    app.dependency_overrides[get_run_repository] = lambda: RunRepository(tmp_path / "runs.sqlite3")
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
+
+
+# ---- Task 3: configurable fake LLM ----------------------------------------------------------------
+class ConfigurableFakeLLM:
+    """Delegates to DemoFakeLLM, but controls the scenario count and can simulate a failing model."""
+
+    def __init__(self, scenario_count: int = 15, error: Optional[Exception] = None):
+        self.scenario_count = scenario_count
+        self.error = error
+        self.prompts: List[str] = []
+        self._delegate = DemoFakeLLM()
+
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        self.prompts.append(prompt)
+        if self.error is not None:
+            raise self.error
+        if schema is ScenarioDraftSet:
+            return make_llm_scenarios(self.scenario_count)
+        return self._delegate.generate_structured(prompt, schema)
+
+
+def make_llm_scenarios(count: int) -> ScenarioDraftSet:
+    """`count` unique drafts that rotate through every required scenario type."""
+    types = list(REQUIRED_TYPES)
+    return ScenarioDraftSet(scenarios=[
+        ScenarioDraft(
+            id=f"X{i}", title=f"LLM scenario {i} for toy order ({types[i % len(types)]})",
+            type=types[i % len(types)], steps=["Open the toy page", "Place the order"],
+            expected_result="The order behaves as specified",
+        )
+        for i in range(count)
+    ])
+
+
+@pytest.fixture
+def fake_llm_factory() -> Callable[..., ConfigurableFakeLLM]:
+    def _factory(scenario_count: int = 15, error: Optional[Exception] = None) -> ConfigurableFakeLLM:
+        return ConfigurableFakeLLM(scenario_count=scenario_count, error=error)
+    return _factory
+
+
+# ---- demo target ------------------------------------------------------------------------------------
+@contextmanager
+def run_demo(defects: Optional[Set[str]] = None) -> UrlIterator:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(create_demo_app(defects or set()), log_level="critical", lifespan="off"))
+    thread = Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+    thread.start()
+    deadline = monotonic() + 5
+    while not server.started and thread.is_alive() and monotonic() < deadline:
+        sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=2)
+        listener.close()
+        raise RuntimeError("Demo target failed to start")
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        listener.close()
+
+
+@pytest.fixture
+def demo_target() -> UrlIterator:
+    with run_demo() as url:
+        yield url
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\fakes.py
+================================================================================
+# File: tests/fakes.py
+# Description: Defines fake implementations for testing purposes.
+# Author Name: Debleena Nandy
+# Date: 07-10-2026
+# Time: 11:41:01 +05:30
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Callable, Dict, List
+
+from pydantic import BaseModel
+
+from agents.failure_analysis_agent.agent import FailureClassificationLLM
+from agents.reporting_agent.agent import ReportNarrative
+from agents.requirement_agent.models import RequirementExtraction
+from agents.requirement_agent.rules import rule_based_analysis
+from agents.root_cause_agent.agent import RootCauseLLM
+from agents.test_design_agent.action_design import ActionDesignStep, ToolCall
+from agents.test_design_agent.action_library import DemoShopActionLibrary
+from agents.test_design_agent.templates import TemplateScenarioGenerator
+from agents.test_planning_agent.agent import PrioritisedPlan
+from core.llm.base import LLMUnavailableError
+from core.models.scenario import QAScenario, ScenarioDraft, ScenarioDraftSet
+from demo_target.main import create_demo_app
+from tools.api_tools.openapi import OpenApiSpec
+
+APPROVAL_TOKEN = "test-token"
+Handler = Callable[[str], BaseModel]
+Texts = List[str]
+DRAFT_FIELDS = set(ScenarioDraft.model_fields)
+PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def untrusted(prompt: str, label: str) -> str:
+    match = re.search(rf"<untrusted_{label}>\n(.*)\n</untrusted_{label}>", prompt, re.DOTALL)
+    if match is None:
+        raise AssertionError(f"Prompt has no <untrusted_{label}> block.")
+    return match.group(1)
+
+
+class DemoFakeLLM:
+    """Deterministic stand-in for the local model, dispatching on the requested schema."""
+
+    def __init__(self, tool_calls: bool = True):
+        self.calls: Texts = []
+        self.prompts: Texts = []
+        self.tool_calls = tool_calls
+        self.spec = OpenApiSpec(create_demo_app(set()).openapi())
+        self.library = DemoShopActionLibrary()
+        self.handlers: Dict[str, Handler] = {
+            "RequirementExtraction": self._requirement,
+            "ScenarioDraftSet": self._scenarios,
+            "ActionDesignStep": self._action,
+            "PrioritisedPlan": self._plan,
+            "FailureClassificationLLM": self._classify,
+            "RootCauseLLM": self._root_cause,
+            "ReportNarrative": self._report,
+        }
+
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        self.calls.append(schema.__name__)
+        self.prompts.append(prompt)
+        return self.handlers[schema.__name__](prompt)
+
+    def _requirement(self, prompt: str) -> BaseModel:
+        story = untrusted(prompt, "requirement")
+        analysis, domain = rule_based_analysis(story)
+        return RequirementExtraction(
+            title=analysis.title, actors=analysis.actors, goal=analysis.goal or "complete the action",
+            business_object=analysis.business_object or "item", benefit=analysis.benefit,
+            business_rules=analysis.business_rules, acceptance_criteria=analysis.acceptance_criteria,
+            missing_requirements=analysis.missing_requirements, ambiguities=analysis.ambiguities,
+            testable_conditions=analysis.testable_conditions, domain=domain.domain, key_concerns=domain.key_concerns)
+
+    def _scenarios(self, prompt: str) -> BaseModel:
+        if "coverage gaps" in prompt:
+            return ScenarioDraftSet(scenarios=[])
+        story = json.loads(untrusted(prompt, "requirement"))["user_story"]
+        analysis, domain = rule_based_analysis(story)
+        generated = TemplateScenarioGenerator().generate(analysis, domain)
+        return ScenarioDraftSet(scenarios=[ScenarioDraft(**s.model_dump(include=DRAFT_FIELDS)) for s in generated])
+
+    def _action(self, prompt: str) -> BaseModel:
+        if self.tool_calls and "Tool results so far:\nnone" in prompt:
+            return ActionDesignStep(tool_call=ToolCall(name="list_endpoints"))
+        data = json.loads(untrusted(prompt, "scenario"))
+        candidate = QAScenario(id="TC-X", title=data["title"], type=data["type"], steps=data["steps"],
+                               expected_result=data["expected_result"])
+        designed = self.library.design(candidate, self.spec)
+        if designed is None or not designed.api_actions:
+            return ActionDesignStep(cannot_automate="The target exposes no API for this scenario.")
+        return ActionDesignStep(api_actions=designed.api_actions)
+
+    def _plan(self, prompt: str) -> BaseModel:
+        items = json.loads(untrusted(prompt, "plan"))
+        ordered = sorted(items, key=lambda item: PRIORITY_RANK.get(item["priority"], 1))
+        order = [item["id"] for item in ordered]
+        return PrioritisedPlan(order=order, risk_notes={sid: "High business risk." for sid in order[:2]})
+
+    def _classify(self, prompt: str) -> BaseModel:
+        payload = json.loads(untrusted(prompt, "evidence"))
+        signal = payload["deterministic_signal"]
+        return FailureClassificationLLM(category=signal["category"], confidence=0.8,
+                                        rationale=f"Evidence indicates: {signal['rationale']}",
+                                        evidence_used=payload["evidence"][:2])
+
+    def _root_cause(self, prompt: str) -> BaseModel:
+        payload = json.loads(untrusted(prompt, "evidence"))
+        categories = [item["category"] for item in payload["classified_failures"]]
+        top = max(set(categories), key=categories.count)
+        return RootCauseLLM(category=top, hypothesis=f"Most failures point to {top}.",
+                            suggested_investigation=["Reproduce the first failing request."],
+                            suggested_remediation=["Fix the underlying rule and re-run the regression scope."],
+                            confidence=0.85, confidence_basis="Consistent evidence across failures.")
+
+    def _report(self, prompt: str) -> BaseModel:
+        run = json.loads(untrusted(prompt, "run"))
+        failed = [item["id"] for item in run["failed"]]
+        summary = run["summary"]
+        return ReportNarrative(
+            executive_summary=f"{summary['passed']} passed and {summary['failed']} failed.",
+            risk_areas=[f"Failures in {', '.join(failed)}"] if failed else [],
+            regression_scope=failed + ["TC-999"],  # TC-999 does not exist and must be filtered out
+            recommendations=["Re-run the regression scope after fixes."])
+
+
+class ScriptedLLM:
+    """Returns (or raises) prepared responses in order."""
+
+    def __init__(self, *responses: Any):
+        self.responses = list(responses)
+        self.calls: Texts = []
+        self.prompts: Texts = []
+
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        self.calls.append(schema.__name__)
+        self.prompts.append(prompt)
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class DeadLLM:
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        raise LLMUnavailableError("Ollama is not reachable (test).")
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\e2e\test_api_e2e.py
+================================================================================
+# File: tests/e2e/test_api_e2e.py
+# Description: Tests complete API endpoint behavior through the public application interface.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+
+def test_root_endpoint(client: TestClient) -> None:
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+
+
+def test_health_endpoint(client: TestClient) -> None:
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_analyze_returns_structured_domain_scenarios(client: TestClient) -> None:
+    response = client.post("/analyze", json={"requirement": "As a customer, I want to place an order to buy a toy"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "As a customer, I want to place an order to buy a toy"
+    assert body["actors"] == ["customer"]
+    assert body["domain"] == "e-commerce"
+    assert body["business_object"] == "toy"
+    assert body["scenario_count"] == len(body["generated_scenarios"]) >= 15
+    assert body["execution_status"] == "not_started"
+    assert body["test_plan"]["approval_status"] == "pending"
+    assert body["test_plan"]["scenarios"][0]["eligibility"] == "blocked"
+    assert body["qa_report"]["scenario_count"] == body["scenario_count"]
+    assert body["root_cause"]["confidence"] is None
+
+    first = body["generated_scenarios"][0]
+    assert {"id", "title", "type", "priority", "preconditions", "steps", "expected_result"} <= first.keys()
+    assert body["criteria"] == []
+    assert body["execution_summary"]["total_scenarios"] == body["scenario_count"]
+    assert body["failure_classification"] == "not_executed"
+
+
+def test_analyze_exposes_acceptance_criteria_traceability(client: TestClient) -> None:
+    response = client.post(
+        "/analyze",
+        json={
+            "requirement": (
+                "As a customer, I want to place an order to buy a toy\n"
+                "Acceptance criteria:\n"
+                "- Customer can order at most 5 units per toy"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["criteria"] == [
+        {"id": "AC-001", "description": "Customer can order at most 5 units per toy"}
+    ]
+    assert any("AC-001" in scenario["criterion_ids"] for scenario in body["generated_scenarios"])
+
+
+def test_whitespace_payload_returns_422(client: TestClient) -> None:
+    assert client.post("/analyze", json={"requirement": " " * 12}).status_code == 422
+
+
+def test_missing_payload_field_returns_422(client: TestClient) -> None:
+    assert client.post("/analyze", json={}).status_code == 422
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\integration\test_api_run_lifecycle.py
+================================================================================
+# File: tests/integration/test_api_run_lifecycle.py
+# Description: Tests approval, execution, and retrieval across the QA run API lifecycle.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from api.main import app, get_run_repository
+from config.settings import settings
+from demo_target.scenarios import create_order_scenario
+from core.persistence.run_repository import RunRepository
+
+
+def test_structured_run_approval_execution_and_retrieval(
+    demo_target: str,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(settings, "qa_api_base_url", demo_target)
+    monkeypatch.setattr(settings, "qa_approval_token", "test-approval-token")
+    app.dependency_overrides[get_run_repository] = lambda: RunRepository(tmp_path / "lifecycle.sqlite3")
+    headers = {"X-QA-Approval-Token": "test-approval-token"}
+    request = {
+        "requirement": (
+            "As a customer, I want to place an order to buy a toy\n"
+            "Acceptance criteria:\n"
+            "- Customer can order at most 5 units per toy"
+        ),
+        "scenarios": [create_order_scenario().model_dump(mode="json")],
+    }
+    try:
+        with TestClient(app) as client:
+            unauthorized = client.post("/runs", json=request)
+            assert unauthorized.status_code == 403
+
+            created_response = client.post("/runs", json=request, headers=headers)
+            assert created_response.status_code == 200
+            created = created_response.json()
+            assert created["run_status"] == "created"
+            assert created["test_plan"]["scenarios"][0]["eligibility"] == "eligible"
+
+            plan_id = created["test_plan"]["id"]
+            run_id = created["run_id"]
+            assert client.get(f"/plans/{plan_id}", headers=headers).status_code == 200
+
+            approved = client.post(
+                f"/plans/{plan_id}/approval",
+                json={"decision": "approved"},
+                headers=headers,
+            )
+            assert approved.status_code == 200
+            assert approved.json()["approval_status"] == "approved"
+
+            executed = client.post(f"/runs/{run_id}/execute", headers=headers)
+            assert executed.status_code == 200
+            assert executed.json()["run_status"] == "completed"
+            assert executed.json()["execution_summary"]["passed"] == 1
+
+            retrieved = client.get(f"/runs/{run_id}", headers=headers)
+            assert retrieved.status_code == 200
+            assert retrieved.json()["qa_report"]["execution_status"] == "completed"
+            assert client.post(f"/runs/{run_id}/execute", headers=headers).status_code == 409
+    finally:
+        app.dependency_overrides.pop(get_run_repository, None)
+
+
+def test_approval_rejects_blocked_analysis_plan(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "qa_approval_token", "review-token")
+    created = client.post(
+        "/analyze",
+        json={"requirement": "As a customer, I want to place an order to buy a toy"},
+    ).json()
+
+    response = client.post(
+        f"/plans/{created['test_plan']['id']}/approval",
+        json={"decision": "approved"},
+        headers={"X-QA-Approval-Token": "review-token"},
+    )
+
+    assert response.status_code == 409
+    assert "target environment" in response.json()["detail"]
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\integration\test_api_runner.py
+================================================================================
+# File: tests/integration/test_api_runner.py
+# Description: Tests API scenario execution against a local HTTP server.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from typing import Iterator
+
+import pytest
+
+from agents.execution_agent.agent import ExecutionAgent
+from agents.test_planning_agent.agent import TestPlanningAgent
+from demo_target.scenarios import create_order_scenario
+from tools.api_tools.runner import ApiScenarioRunner
+from core.models.actions import ApiAssertion, ApiRequestAction
+from core.models.scenario import QAScenario
+
+
+class DemoHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        if self.path == "/orders":
+            length = int(self.headers.get("Content-Length", "0"))
+            request_body = json.loads(self.rfile.read(length))
+            body = json.dumps({"id": "order-1", "quantity": request_body["quantity"]}).encode()
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404)
+
+    def do_GET(self) -> None:
+        if self.path == "/openapi.json":
+            body = json.dumps(
+                {
+                    "openapi": "3.0.0",
+                    "paths": {"/orders": {"post": {}}, "/redirect": {"get": {}}},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/")
+            self.end_headers()
+            return
+        self.send_error(404)
+
+    def log_message(self, _format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def local_target() -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DemoHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_approved_api_plan_executes_against_controlled_demo(demo_target: str) -> None:
+    scenario = create_order_scenario()
+    plan = TestPlanningAgent(demo_target).create_plan([scenario])
+    assert plan.scenarios[0].eligibility == "eligible"
+    approved_plan = plan.model_copy(update={"approval_status": "approved"})
+    runner = ApiScenarioRunner(demo_target)
+
+    try:
+        execution = ExecutionAgent(api_runner=runner).execute(approved_plan, [scenario])
+    finally:
+        runner.api_tool.close()
+
+    assert execution.passed == 1
+    assert execution.total_scenarios == 1
+    assert any("HTTP 201" in evidence for evidence in execution.steps[0].evidence)
+
+
+def test_api_runner_executes_request_and_checks_response(local_target: str) -> None:
+    scenario = QAScenario(
+        id="TC-API-001",
+        title="Create an order",
+        type="api",
+        steps=["Submit an order"],
+        expected_result="The order is created",
+        api_actions=[
+            ApiRequestAction(
+                method="POST",
+                path="/orders",
+                json_body={"quantity": 2},
+                assertions=[
+                    ApiAssertion(type="status_code", expected=201),
+                    ApiAssertion(type="json_equals", json_path="id", expected="order-1"),
+                    ApiAssertion(type="json_equals", json_path="quantity", expected=2),
+                ],
+            )
+        ],
+    )
+    runner = ApiScenarioRunner(local_target)
+    try:
+        result = runner.execute(scenario)
+    finally:
+        runner.api_tool.close()
+
+    assert result.passed == 1
+    assert result.steps[0].evidence
+
+
+def test_api_runner_fails_mismatched_assertion_without_leaking_body(local_target: str) -> None:
+    scenario = QAScenario(
+        id="TC-API-002",
+        title="Detect an order mismatch",
+        type="api",
+        steps=["Submit an order"],
+        expected_result="Wrong expected order id is detected",
+        api_actions=[
+            ApiRequestAction(
+                method="POST",
+                path="/orders",
+                json_body={"quantity": 2},
+                assertions=[ApiAssertion(type="json_equals", json_path="id", expected="secret-value")],
+            )
+        ],
+    )
+    runner = ApiScenarioRunner(local_target)
+    try:
+        result = runner.execute(scenario)
+    finally:
+        runner.api_tool.close()
+
+    assert result.failed == 1
+    assert "secret-value" not in " ".join(result.steps[0].evidence + [result.steps[0].details or ""])
+
+
+def test_api_runner_does_not_follow_redirects(local_target: str) -> None:
+    scenario = QAScenario(
+        id="TC-API-003",
+        title="Reject redirect",
+        type="api",
+        steps=["Get redirect endpoint"],
+        expected_result="Redirect is not followed",
+        api_actions=[
+            ApiRequestAction(
+                method="GET",
+                path="/redirect",
+                assertions=[ApiAssertion(type="status_code", expected=200)],
+            )
+        ],
+    )
+    runner = ApiScenarioRunner(local_target)
+    try:
+        result = runner.execute(scenario)
+    finally:
+        runner.api_tool.close()
+
+    assert result.failed == 1
+    assert "RedirectNotAllowed" in " ".join(result.steps[0].evidence)
+
+
+def test_api_runner_rejects_non_loopback_target() -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        ApiScenarioRunner("http://example.com")
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_artifact_tools.py
+================================================================================
+# File: tests/unit/test_artifact_tools.py
+# Description: Tests QA report serialization and safe artifact file storage.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from agents.reporting_agent.agent import QAReportAgent
+from agents.failure_analysis_agent.agent import FailureAnalysisAgent
+from agents.execution_agent.agent import ExecutionAgent
+from agents.root_cause_agent.agent import RootCauseAgent
+from agents.test_planning_agent.agent import TestPlanningAgent
+from core.models.requirement import AcceptanceCriterion
+from core.models.scenario import QAScenario
+from tools.filesystem_tools.store import WorkspaceFileStore
+from tools.reporting_tools.writer import QAReportWriter
+
+
+def test_report_writer_writes_json_under_configured_root(tmp_path) -> None:
+    scenario = QAScenario(
+        id="TC-001",
+        title="Verify order limit",
+        type="boundary",
+        steps=["Submit maximum quantity"],
+        expected_result="Limit is enforced",
+        criterion_ids=["AC-001"],
+    )
+    criteria = [AcceptanceCriterion(id="AC-001", description="Orders are limited")]
+    plan = TestPlanningAgent().create_plan([scenario])
+    execution = ExecutionAgent().execute(plan, [scenario])
+    failure = FailureAnalysisAgent().analyze(execution)
+    root_cause = RootCauseAgent().analyze(execution, failure)
+    report = QAReportAgent().generate(
+        plan=plan,
+        criteria=criteria,
+        scenarios=[scenario],
+        execution=execution,
+        failure=failure,
+        root_cause=root_cause,
+        workflow_status="completed",
+        execution_status="not_started",
+    )
+
+    saved_path = QAReportWriter(WorkspaceFileStore(tmp_path)).write_json(report, "runs/report.json")
+
+    assert json.loads((tmp_path / "runs" / "report.json").read_text(encoding="utf-8"))["plan_id"] == plan.id
+    assert saved_path.endswith("report.json")
+
+
+@pytest.mark.parametrize("path", ["../outside.json", "nested/../../outside.json"])
+def test_file_store_rejects_paths_outside_root(tmp_path, path: str) -> None:
+    store = WorkspaceFileStore(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="inside the configured root"):
+        store.write_text(path, "not allowed")
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_demo_api.py
+================================================================================
+# File: tests/unit/test_demo_api.py
+# Description: Tests order creation, retrieval, and validation in the demo API.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from demo_target.main import create_demo_app
+
+
+def test_demo_api_creates_and_retrieves_order() -> None:
+    client = TestClient(create_demo_app())
+    created = client.post("/orders", json={"product_id": "toy-001", "quantity": 2})
+
+    assert created.status_code == 201
+    order = created.json()
+    assert order["product_id"] == "toy-001"
+    assert order["quantity"] == 2
+    assert client.get(f"/orders/{order['id']}").json() == order
+
+
+def test_demo_api_rejects_quantity_above_limit() -> None:
+    response = TestClient(create_demo_app()).post(
+        "/orders",
+        json={"product_id": "toy-001", "quantity": 6},
+    )
+
+    assert response.status_code == 422
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_domain_agent.py
+================================================================================
+# File: tests/unit/test_domain_agent.py
+# Description: Tests rule-based and language-model-assisted domain detection.
+# Author Name: Debleena Nandy
+# Date: 07-10-2026
+from __future__ import annotations
+
+import pytest
+
+from agents.requirement_agent.agent import RequirementAgent
+from core.llm.agent_support import AgentLLMError
+from tests.fakes import DeadLLM
+
+STORY = "As a customer, I want to place an order to buy a toy"
+
+
+@pytest.mark.parametrize(
+    "story, expected_domain",
+    [
+        (STORY, "e-commerce"),
+        ("As a customer, I want to log in to my account securely.", "authentication"),
+        ("As a user, I want to upload a profile photo", "account-management"),
+        ("As an admin, I want to export a monthly report", "general"),
+    ],
+)
+def test_rule_based_domain_detection(story: str, expected_domain: str) -> None:
+    _, profile, mode = RequirementAgent(DeadLLM(), use_fallback=True).analyze(story)  # VERIFY: DeadLLM() args
+    assert mode == "rule_based"
+    assert profile.domain == expected_domain
+    assert profile.key_concerns
+
+
+def test_uses_llm_when_available(fake_llm_factory) -> None:
+    _, profile, mode = RequirementAgent(fake_llm_factory()).analyze(STORY)
+    assert mode == "llm"
+    assert profile.business_object == "toy"
+
+
+def test_falls_back_when_llm_fails_and_fallback_enabled(fake_llm_factory) -> None:
+    llm = fake_llm_factory(error=TimeoutError("ollama timeout"))
+    _, profile, mode = RequirementAgent(llm, use_fallback=True).analyze(STORY)
+    assert mode == "rule_based"
+    assert profile.domain == "e-commerce"
+
+
+def test_llm_failure_is_raised_when_fallback_disabled(fake_llm_factory) -> None:
+    llm = fake_llm_factory(error=TimeoutError("ollama timeout"))
+    with pytest.raises(AgentLLMError):
+        RequirementAgent(llm, use_fallback=False).analyze(STORY)
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_failure_analysis_agent.py
+================================================================================
+# File: tests/unit/test_failure_analysis_agent.py
+# Description: Tests classification of QA execution results and failures.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from agents.failure_analysis_agent.agent import FailureAnalysisAgent
+from core.models.execution_result import ExecutionResult, ExecutionStepResult
+
+
+def _result(*statuses: str) -> ExecutionResult:
+    result = ExecutionResult()
+    for i, status in enumerate(statuses):
+        result.add_step(ExecutionStepResult(scenario=f"TC-{i}", status=status, details="boom"))
+    return result
+
+
+def test_all_passed_is_a_pass() -> None:
+    report = FailureAnalysisAgent().analyze(_result("passed", "passed"))
+    assert report.classification == "baseline_validation_pass"
+    assert report.risk_level == "low"
+
+
+def test_any_failure_is_high_risk() -> None:
+    report = FailureAnalysisAgent().analyze(_result("passed", "failed"))
+    assert report.classification == "runtime_integration_failure"
+    assert report.risk_level == "high"
+    assert report.evidence == ["TC-1: boom"]
+
+
+def test_nothing_executed_is_not_a_pass_or_failure() -> None:
+    report = FailureAnalysisAgent().analyze(_result("not_executed", "not_executed"))
+    assert report.classification == "not_executed"
+
+
+def test_mixed_statuses_are_partial() -> None:
+    report = FailureAnalysisAgent().analyze(_result("passed", "skipped"))
+    assert report.classification == "partially_executed"
+
+
+def test_empty_run_is_not_executed() -> None:
+    assert FailureAnalysisAgent().analyze(ExecutionResult()).classification == "not_executed"
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_llm_base.py
+================================================================================
+# File: tests/unit/test_llm_base.py
+# Description: Tests the shared structured language model interfaces and errors.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock
+
+
+from core.llm import ollama_client
+from core.llm.base import (
+    ClosableLLM, HealthCheckableLLM, LLMClient, LLMError, LLMResponseError, StructuredLLM,
+    check_llm_health, close_llm,
+)
+from core.llm.ollama_client import OllamaClient
+
+
+class FakeLLM:
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        return schema()
+
+
+class NotAnLLM:
+    pass
+
+
+def test_ollama_client_satisfies_all_protocols() -> None:
+    client = OllamaClient("http://x", "llama3.1")
+    assert isinstance(client, StructuredLLM)
+    assert isinstance(client, HealthCheckableLLM)
+    assert isinstance(client, ClosableLLM)
+
+
+def test_fake_llm_only_needs_generate_structured() -> None:
+    fake = FakeLLM()
+    assert isinstance(fake, StructuredLLM)
+    assert not isinstance(fake, HealthCheckableLLM)
+    assert not isinstance(NotAnLLM(), StructuredLLM)
+    assert LLMClient is StructuredLLM
+
+
+def test_error_hierarchy_is_shared_with_ollama_client() -> None:
+    assert ollama_client.LLMResponseError is LLMResponseError
+    assert issubclass(LLMResponseError, LLMError)
+    assert issubclass(LLMError, RuntimeError)
+
+
+def test_check_llm_health() -> None:
+    assert check_llm_health(None) is None
+    fake_health = check_llm_health(FakeLLM())
+    assert fake_health is not None
+    assert fake_health["reachable"] is True
+    client = OllamaClient("http://x", "llama3.1")
+    client.health = MagicMock(return_value={"reachable": False, "model_available": False})  # type: ignore[method-assign]
+    assert check_llm_health(client, timeout=1) == {"reachable": False, "model_available": False}
+    client.health.assert_called_once_with(timeout=1)
+
+
+def test_close_llm_is_safe_for_any_client() -> None:
+    close_llm(None)
+    close_llm(FakeLLM())
+    client = OllamaClient("http://x", "llama3.1")
+    client._session = MagicMock()
+    close_llm(client)
+    client._session.close.assert_called_once()
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_planning_and_reporting_agents.py
+================================================================================
+# File: tests/unit/test_planning_and_reporting_agents.py
+# Description: Tests QA test planning and report generation behavior.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import pytest
+
+from agents.execution_agent.agent import ExecutionAgent
+from agents.failure_analysis_agent.agent import FailureAnalysisAgent
+from agents.reporting_agent.agent import QAReportAgent
+from agents.root_cause_agent.agent import RootCauseAgent
+from agents.test_planning_agent.agent import TestPlanningAgent
+from core.models.execution_result import ExecutionResult
+from core.models.actions import ApiAssertion, ApiRequestAction
+from core.models.requirement import AcceptanceCriterion
+from core.models.scenario import QAScenario
+
+
+def test_planning_blocks_scenarios_without_structured_actions() -> None:
+    scenario = QAScenario(
+        id="TC-001",
+        title="Create an order through the API",
+        type="api",
+        steps=["POST /orders with a valid order"],
+        expected_result="The order is created",
+        criterion_ids=["AC-001"],
+    )
+
+    plan = TestPlanningAgent().create_plan([scenario])
+
+    assert plan.approval_status == "pending"
+    assert plan.target_environment == "unconfigured"
+    assert plan.scenarios[0].runner == "api"
+    assert plan.scenarios[0].criterion_ids == ["AC-001"]
+    assert plan.scenarios[0].eligibility == "blocked"
+
+
+def test_api_action_contract_rejects_external_or_traversal_paths() -> None:
+    for path in ("https://example.com/orders", "//example.com/orders", "/../admin"):
+        with pytest.raises(ValueError):
+            ApiRequestAction(
+                method="GET",
+                path=path,
+                assertions=[ApiAssertion(type="status_code", expected=200)],
+            )
+
+
+def test_api_assertions_validate_required_json_path() -> None:
+    with pytest.raises(ValueError, match="requires json_path"):
+        ApiAssertion(type="json_equals", expected="created")
+
+
+def test_execution_agent_does_not_execute_unapproved_plan() -> None:
+    scenario = QAScenario(
+        id="TC-001",
+        title="Create an order",
+        type="api",
+        steps=["POST /orders"],
+        expected_result="The order is created",
+    )
+    plan = TestPlanningAgent().create_plan([scenario])
+
+    result = ExecutionAgent().execute(plan, [scenario])
+
+    assert result.not_executed == 1
+    assert "approval is pending" in (result.steps[0].details or "")
+
+
+def test_report_exposes_coverage_and_never_claims_root_cause_without_evidence() -> None:
+    scenario = QAScenario(
+        id="TC-001",
+        title="Verify order limit",
+        type="boundary",
+        steps=["Set quantity to 6"],
+        expected_result="The limit is enforced",
+        criterion_ids=["AC-001"],
+    )
+    criterion = AcceptanceCriterion(id="AC-001", description="Orders are limited to five items")
+    plan = TestPlanningAgent().create_plan([scenario])
+    execution = ExecutionAgent().execute(plan, [scenario])
+    failure = FailureAnalysisAgent().analyze(execution)
+    root_cause = RootCauseAgent().analyze(execution, failure)
+
+    report = QAReportAgent().generate(
+        plan=plan,
+        criteria=[criterion],
+        scenarios=[scenario],
+        execution=execution,
+        failure=failure,
+        root_cause=root_cause,
+        workflow_status="completed",
+        execution_status="not_started",
+    )
+
+    assert report.covered_criterion_ids == ["AC-001"]
+    assert report.uncovered_criterion_ids == []
+    assert report.execution_summary == ExecutionResult(
+        total_scenarios=1, not_executed=1, steps=execution.steps
+    ).summary()
+    assert report.root_cause.confidence is None
+    assert "No scenario execution evidence" in report.root_cause.hypothesis
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_requirement_agent.py
+================================================================================
+# File: tests/unit/test_requirement_agent.py
+# Description: Tests extraction of actors, goals, and criteria from requirements.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import pytest
+
+from agents.requirement_agent.agent import RequirementAgent
+
+
+def test_extracts_actor_goal_and_business_object() -> None:
+    analysis = RequirementAgent().analyze("As a customer, I want to place an order to buy a toy")
+
+    assert analysis.actors == ["customer"]
+    assert analysis.goal == "place an order to buy a toy"
+    assert analysis.business_object == "toy"
+
+
+def test_extracts_benefit_and_explicit_acceptance_criteria() -> None:
+    story = (
+        "As a customer, I want to place an order to buy a toy so that it is delivered to me.\n"
+        "Acceptance criteria:\n"
+        "- Customer can order at most 5 units per toy\n"
+        "- Out-of-stock toys cannot be ordered"
+    )
+    analysis = RequirementAgent().analyze(story)
+
+    assert analysis.benefit == "it is delivered to me"
+    assert len(analysis.acceptance_criteria) == 2
+    assert [(criterion.id, criterion.description) for criterion in analysis.criteria] == [
+        ("AC-001", "Customer can order at most 5 units per toy"),
+        ("AC-002", "Out-of-stock toys cannot be ordered"),
+    ]
+    assert "at most 5 units" in analysis.business_rules[0]
+    assert analysis.ambiguities == []
+
+
+def test_story_is_not_repeated_as_a_business_rule() -> None:
+    analysis = RequirementAgent().analyze("As a customer, I want to log in to my account securely.")
+
+    assert analysis.business_rules == []
+
+
+def test_reports_missing_information_as_ambiguities() -> None:
+    analysis = RequirementAgent().analyze("Build the toy ordering feature quickly")
+    text = " ".join(analysis.ambiguities).lower()
+
+    assert analysis.actors == []
+    assert "actor" in text
+    assert "acceptance criteria" in text
+
+
+def test_cancel_is_not_detected_as_can_rule() -> None:
+    analysis = RequirementAgent().analyze("As a customer, I want to cancel an order.\nThe cancel button is red.")
+
+    assert analysis.business_rules == []
+
+
+def test_rejects_empty_requirement() -> None:
+    with pytest.raises(ValueError, match="Requirement text cannot be empty"):
+        RequirementAgent().analyze("   ")
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_review_regressions.py
+================================================================================
+# File: tests/unit/test_review_regressions.py
+# Description: Tests regression cases for previously identified QA workflow issues.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from typing import Any, List
+from unittest.mock import MagicMock
+
+import pytest
+import requests
+from fastapi.testclient import TestClient
+
+from agents.requirement_agent.domain import DomainAgent
+from agents.requirement_agent.agent import RequirementAgent
+from api.main import app, get_workflow
+from config.settings import settings
+from agents.execution_agent.routing import execution_type_for
+from graph.workflow import QAWorkflow
+from core.llm.base import LLMUnavailableError, is_llm_unavailable
+from core.llm.ollama_client import OllamaClient
+from core.models.scenario import DomainProfile, QAScenario, ScenarioSet
+
+TOY = "As a customer, I want to place an order to buy a toy"
+
+
+# ---- requirement_agent: wrapped stories --------------------------------
+def test_rule_line_is_not_swallowed_into_goal() -> None:
+    analysis = RequirementAgent().analyze("As a customer, I want to buy a toy\nquantity must be at most 5")
+    assert analysis.goal == "buy a toy"
+    assert analysis.business_rules == ["quantity must be at most 5"]
+
+
+def test_wrapped_story_with_benefit_is_joined() -> None:
+    analysis = RequirementAgent().analyze("As a customer,\nI want to buy a toy\nso that my kid is happy")
+    assert (analysis.actors, analysis.goal, analysis.benefit) == (["customer"], "buy a toy", "my kid is happy")
+
+
+def test_wrapped_goal_is_joined() -> None:
+    assert RequirementAgent().analyze("As a customer, I want to buy\na wooden toy").goal == "buy a wooden toy"
+
+
+# ---- domain_agent ------------------------------------------------------
+@pytest.mark.parametrize("story", ["As a user, I want to keep shopping later", "As a user, I want to see what I paid"])
+def test_irregular_ecommerce_forms(story: str) -> None:
+    analysis = RequirementAgent().analyze(story)
+    assert DomainAgent().extract(analysis, story)[0].domain == "e-commerce"
+
+
+# ---- executor routing --------------------------------------------------
+def _sc(steps: List[str], kind: Any = "security") -> QAScenario:
+    return QAScenario(id="1", title="t", type=kind, steps=steps, expected_result="r")
+
+
+@pytest.mark.parametrize(
+    "steps, expected",
+    [
+        (["Request GET /orders/<id> with the customer's token"], "api"),
+        (["PUT the profile with valid data", "GET the profile"], "api"),
+        (["Send an update request for the other user's id"], "api"),
+        (["Open the API docs page in the browser"], "browser"),
+        (["Put the item in the cart"], "browser"),
+        (["Proceed to checkout"], "browser"),
+    ],
+)
+def test_execution_routing(steps: List[str], expected: str) -> None:
+    assert execution_type_for(_sc(steps, "functional")) == expected
+
+
+# ---- workflow: LLM skip only when unreachable --------------------------
+class ScriptedLLM:
+    def __init__(self, domain_error: Exception) -> None:
+        self.domain_error = domain_error
+        self.calls: List[type] = []
+
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        self.calls.append(schema)
+        if schema is DomainProfile:
+            raise self.domain_error
+        return ScenarioSet(scenarios=[_sc(["s"], "api") for _ in range(10)])
+
+
+def test_unreachable_llm_is_called_once() -> None:
+    llm = ScriptedLLM(LLMUnavailableError("down"))
+    state = QAWorkflow(llm_client=llm).run(TOY)
+    assert llm.calls == [DomainProfile]
+    assert state.generation_mode == "rule_based"
+
+
+def test_bad_domain_answer_still_tries_scenarios() -> None:
+    llm = ScriptedLLM(ValueError("invalid JSON"))
+    state = QAWorkflow(llm_client=llm).run(TOY)
+    assert llm.calls == [DomainProfile, ScenarioSet]
+    assert (state.domain_mode, state.generation_mode) == ("rule_based", "llm")
+
+
+def test_unavailable_classification() -> None:
+    assert is_llm_unavailable(LLMUnavailableError("x"))
+    assert is_llm_unavailable(TimeoutError())
+    assert not is_llm_unavailable(ValueError())
+
+
+def test_ollama_wraps_connection_errors() -> None:
+    client = OllamaClient("http://x", "m")
+    client._session = MagicMock()
+    client._session.post.side_effect = requests.ConnectionError("refused")
+    with pytest.raises(LLMUnavailableError, match="not reachable"):
+        client.generate_structured("p", DomainProfile)
+
+
+# ---- API: sessions are closed, health is honest -----------------------
+class ClosableFake:
+    """Real class (not MagicMock): runtime_checkable protocols inspect attributes statically."""
+
+    def __init__(self, health: Any = None) -> None:
+        self.closed = 0
+        self._health = health
+
+    def generate_structured(self, prompt: str, schema: type) -> Any:
+        raise LLMUnavailableError("not used")
+
+    def health(self, timeout: float = 3) -> Any:
+        return self._health
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_workflow_dependency_closes_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ClosableFake()
+    monkeypatch.setattr("graph.workflow.build_llm_client", lambda: fake)
+    gen = get_workflow()
+    next(gen)
+    with pytest.raises(StopIteration):
+        next(gen)
+    assert fake.closed == 1
+
+
+def test_health_degraded_and_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ClosableFake({"reachable": True, "model_available": False, "model": "llama3.1"})
+    monkeypatch.setattr(settings, "llm_enabled", True)
+    monkeypatch.setattr("api.main.build_llm_client", lambda: fake)
+    body = TestClient(app).get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["llm"]["model"] == "llama3.1"
+    assert fake.closed == 1
+
+
+def test_oversized_requirement_returns_422(client: TestClient) -> None:
+    payload = {"requirement": "As a user, " + "x" * (settings.max_requirement_chars + 1)}
+    assert client.post("/analyze", json=payload).status_code == 422
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_test_design_agent.py
+================================================================================
+# File: tests/unit/test_test_design_agent.py
+# Description: Tests generation of structured QA scenarios from requirements.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from agents.requirement_agent.domain import DomainAgent
+from agents.requirement_agent.agent import RequirementAgent
+from agents.test_design_agent.agent import TestDesignAgent
+
+TOY_STORY = "As a customer, I want to place an order to buy a toy"
+GENERIC_LABELS = [
+    "the user completes the primary business action successfully",
+    "invalid input is rejected without breaking the flow",
+]
+
+
+def _design(story: str, llm=None):
+    analysis = RequirementAgent().analyze(story)
+    domain, _ = DomainAgent(llm).extract(analysis, story)
+    return TestDesignAgent(llm).generate_scenarios(analysis, domain, story)
+
+
+def test_fallback_scenarios_are_concrete_and_domain_specific() -> None:
+    scenarios, mode = _design(TOY_STORY)
+    text = " ".join(s.title + " " + " ".join(s.steps) for s in scenarios).lower()
+
+    assert mode == "rule_based"
+    assert len(scenarios) >= 15
+    for concern in ["toy", "stock", "payment", "shipping", "quantity", "duplicate"]:
+        assert concern in text, f"missing coverage for {concern}"
+    assert not any(label in text for label in GENERIC_LABELS)
+
+
+def test_scenarios_have_reviewable_steps_and_expected_results() -> None:
+    scenarios, _ = _design(TOY_STORY)
+
+    assert {s.type for s in scenarios} == {
+        "functional", "positive", "negative", "boundary", "equivalence",
+        "integration", "api", "ui", "security", "error_handling",
+    }
+    assert 15 <= len(scenarios) <= 20
+    for scenario in scenarios:
+        assert scenario.steps and scenario.expected_result
+    assert [s.id for s in scenarios] == [f"TC-{i:03d}" for i in range(1, len(scenarios) + 1)]
+
+
+def test_unknown_domain_still_uses_story_details() -> None:
+    scenarios, _ = _design("As an admin, I want to export a monthly report")
+    text = " ".join(s.title for s in scenarios).lower()
+
+    assert "admin" in text and "report" in text
+
+
+def test_explicit_acceptance_criteria_become_scenarios() -> None:
+    story = TOY_STORY + "\nAcceptance criteria:\n- Customer can order at most 5 units per toy"
+    scenarios, _ = _design(story)
+
+    assert scenarios[0].expected_result == "Customer can order at most 5 units per toy"
+    assert scenarios[0].criterion_ids == ["AC-001"]
+
+
+def test_llm_scenarios_are_linked_to_acceptance_criteria(fake_llm_factory) -> None:
+    story = TOY_STORY + "\nAcceptance criteria:\n- Customer can order at most 5 units per toy"
+    scenarios, mode = _design(story, fake_llm_factory(scenario_count=15))
+
+    assert mode == "llm"
+    assert any("AC-001" in scenario.criterion_ids for scenario in scenarios)
+    assert all(set(scenario.criterion_ids) <= {"AC-001"} for scenario in scenarios)
+
+
+def test_llm_scenarios_cover_all_required_types(fake_llm_factory) -> None:
+    llm = fake_llm_factory(scenario_count=15)
+    scenarios, mode = _design(TOY_STORY, llm)
+
+    assert mode == "llm"
+    assert len(scenarios) == 20
+    assert scenarios[0].id == "TC-001"
+    assert "toy" in llm.prompts[-1] and "e-commerce" in llm.prompts[-1]
+
+
+def test_too_few_llm_scenarios_falls_back(fake_llm_factory) -> None:
+    scenarios, mode = _design(TOY_STORY, fake_llm_factory(scenario_count=3))
+
+    assert mode == "rule_based"
+    assert 15 <= len(scenarios) <= 20
+
+
+def test_llm_error_falls_back(fake_llm_factory) -> None:
+    scenarios, mode = _design(TOY_STORY, fake_llm_factory(error=ValueError("invalid JSON")))
+
+    assert mode == "rule_based"
+    assert scenarios
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_traceability_evaluator.py
+================================================================================
+# File: tests/unit/test_traceability_evaluator.py
+# Description: Tests acceptance criterion coverage evaluation.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from core.models.requirement import AcceptanceCriterion
+from core.models.scenario import QAScenario
+from evaluation.evaluators.traceability import TraceabilityEvaluator
+
+
+def test_evaluator_reports_missing_and_unknown_criterion_links() -> None:
+    criteria = [
+        AcceptanceCriterion(id="AC-001", description="Order quantity is limited"),
+        AcceptanceCriterion(id="AC-002", description="Out of stock orders are rejected"),
+    ]
+    scenarios = [
+        QAScenario(
+            id="TC-001",
+            title="Check quantity limit",
+            type="boundary",
+            steps=["Submit limit + 1"],
+            expected_result="The quantity is rejected",
+            criterion_ids=["AC-001", "AC-999"],
+        )
+    ]
+
+    result = TraceabilityEvaluator().evaluate(criteria, scenarios)
+
+    assert result.criterion_count == 2
+    assert result.covered_criterion_ids == ["AC-001"]
+    assert result.uncovered_criterion_ids == ["AC-002"]
+    assert result.unknown_criterion_ids == ["AC-999"]
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\tests\unit\test_workflow.py
+================================================================================
+# File: tests/unit/test_workflow.py
+# Description: Tests orchestration and state transitions of the QA workflow.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+import pytest
+
+from graph.workflow import QAWorkflow
+
+
+def test_workflow_produces_domain_specific_report() -> None:
+    state = QAWorkflow().run("As a customer, I want to place an order to buy a toy")
+
+    assert state.status == "completed"
+    assert state.title.startswith("As a customer")
+    assert state.actors == ["customer"]
+    assert state.domain == "e-commerce"
+    assert state.business_object == "toy"
+    assert state.generation_mode == "rule_based"
+    assert len(state.generated_scenarios) >= 15
+    assert state.execution_status == "not_started"
+    assert state.test_plan.approval_status == "pending"
+    assert all(item.eligibility == "blocked" for item in state.test_plan.scenarios)
+    assert state.qa_report is not None
+    assert state.qa_report.scenario_count == len(state.generated_scenarios)
+    assert state.root_cause is not None
+    assert state.root_cause.confidence is None
+
+
+def test_execution_summary_adds_up() -> None:
+    state = QAWorkflow().run("As a customer, I want to log in securely.")
+    summary = state.execution_summary
+
+    assert summary["total_scenarios"] == len(state.generated_scenarios)
+    assert summary["passed"] + summary["failed"] + summary["skipped"] + summary["not_executed"] == summary["total_scenarios"]
+    assert summary["failed"] == 0
+    assert state.failure_classification == "not_executed"
+    assert state.execution_status == "not_started"
+
+
+def test_workflow_uses_injected_llm(fake_llm_factory) -> None:
+    state = QAWorkflow(fake_llm_factory(scenario_count=15)).run(
+        "As a customer, I want to place an order to buy a toy"
+    )
+    assert state.generation_mode == "llm"
+    assert 15 <= len(state.generated_scenarios) <= 20
+    assert state.execution_status == "not_started"
+
+
+def test_workflow_rejects_empty_requirement() -> None:
+    with pytest.raises(ValueError, match="Requirement text cannot be empty"):
+        QAWorkflow().run("   ")
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\__init__.py
+================================================================================
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\run_evaluation.py
+================================================================================
+# File: evaluation/run_evaluation.py
+# Description: Runs deterministic scenario quality gates against a versioned evaluation dataset.
+# Author Name: Debleena Nandy
+# Date: 07-10-2026
+"""Run offline QA scenario quality evaluation and write a JSON report."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from agents.requirement_agent.agent import RequirementAgent
+from agents.requirement_agent.domain import DomainAgent
+from agents.test_design_agent.agent import TestDesignAgent
+from evaluation.evaluators.quality import ScenarioQualityEvaluator
+
+ROOT = Path(__file__).resolve().parents[1]
+DATASET_PATH = ROOT / "evaluation" / "datasets" / "scenarios.json"
+BASELINE_PATH = ROOT / "evaluation" / "datasets" / "baseline.json"
+REPORT_PATH = ROOT / "evaluation" / "reports" / "latest.json"
+
+
+def run_evaluation(update_baseline: bool = False) -> dict[str, Any]:
+    dataset = json.loads(DATASET_PATH.read_text(encoding="utf-8"))
+    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    requirement_agent = RequirementAgent()
+    domain_agent = DomainAgent()
+    test_design_agent = TestDesignAgent()
+    evaluator = ScenarioQualityEvaluator()
+    cases = []
+    failures = []
+
+    for case in dataset:
+        requirement = case["requirement"]
+        analysis = requirement_agent.analyze(requirement)
+        domain, _ = domain_agent.extract(analysis, requirement)
+        scenarios, mode = test_design_agent.generate_scenarios(
+            analysis,
+            domain,
+            requirement,
+            use_llm=False,
+        )
+        metrics = evaluator.evaluate(analysis.criteria, scenarios).to_dict()
+        result = {
+            "id": case["id"],
+            "domain": domain.domain,
+            "generation_mode": mode,
+            "metrics": metrics,
+        }
+        cases.append(result)
+        gates = {
+            "domain": domain.domain == case["expected_domain"],
+            "scenario_count": metrics["scenario_count"] >= case["minimum_scenarios"],
+            "type_diversity": metrics["type_diversity"] >= case["minimum_type_diversity"],
+            "criterion_coverage": metrics["criterion_coverage"] >= case["minimum_criterion_coverage"],
+            "scenario_completeness": (
+                metrics["complete_scenarios"] == metrics["total_scenarios"]
+            ),
+        }
+        result["gates"] = gates
+        failures.extend(f"{case['id']}:{name}" for name, passed in gates.items() if not passed)
+
+    if update_baseline:
+        baseline["minimum_scenario_count"] = min(
+            min(case["metrics"]["scenario_count"] for case in cases),
+            baseline["minimum_scenario_count"],
+        )
+        baseline["minimum_type_diversity"] = min(
+            min(case["metrics"]["type_diversity"] for case in cases),
+            baseline["minimum_type_diversity"],
+        )
+        baseline["minimum_criterion_coverage"] = min(
+            min(case["metrics"]["criterion_coverage"] for case in cases),
+            baseline["minimum_criterion_coverage"],
+        )
+        BASELINE_PATH.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "dataset": DATASET_PATH.relative_to(ROOT).as_posix(),
+        "cases": cases,
+        "passed": not failures,
+        "failures": failures,
+    }
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--update-baseline", action="store_true")
+    args = parser.parse_args()
+    report = run_evaluation(args.update_baseline)
+    print(json.dumps(report, indent=2))
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\datasets\baseline.json
+================================================================================
+{
+  "minimum_scenario_count": 15,
+  "minimum_type_diversity": 1.0,
+  "minimum_criterion_coverage": 1.0,
+  "minimum_complete_scenario_ratio": 1.0
+}
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\datasets\scenarios.json
+================================================================================
+[
+  {
+    "id": "order-limit",
+    "requirement": "As a customer, I want to place an order to buy a toy so that I can receive it at home.\nAcceptance criteria:\n- Customer can order at most 5 units per toy\n- Out-of-stock toys cannot be ordered",
+    "expected_domain": "e-commerce",
+    "minimum_scenarios": 15,
+    "minimum_type_diversity": 1.0,
+    "minimum_criterion_coverage": 1.0
+  }
+]
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\evaluators\__init__.py
+================================================================================
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\evaluators\quality.py
+================================================================================
+# File: evaluation/evaluators/quality.py
+# Description: Measures scenario quantity, coverage, quality fields, and type diversity.
+# Author Name: Debleena Nandy
+# Date: 07-10-2026
+"""Deterministic quality metrics for generated QA scenarios."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Sequence
+
+from core.models.requirement import AcceptanceCriterion
+from core.models.scenario import QAScenario
+from evaluation.evaluators.traceability import TraceabilityEvaluator
+
+REQUIRED_SCENARIO_TYPES = {
+    "functional",
+    "positive",
+    "negative",
+    "boundary",
+    "equivalence",
+    "integration",
+    "api",
+    "ui",
+    "security",
+    "error_handling",
+}
+
+
+@dataclass(frozen=True)
+class ScenarioQuality:
+    scenario_count: int
+    scenario_count_score: float
+    type_diversity: float
+    criterion_coverage: float
+    complete_scenarios: int
+    total_scenarios: int
+
+    def to_dict(self) -> dict[str, int | float]:
+        return asdict(self)
+
+
+class ScenarioQualityEvaluator:
+    """Scores scenario outputs against explicit, reviewable quality dimensions."""
+
+    def evaluate(
+        self,
+        criteria: Sequence[AcceptanceCriterion],
+        scenarios: Sequence[QAScenario],
+    ) -> ScenarioQuality:
+        types = {scenario.type for scenario in scenarios}
+        coverage = TraceabilityEvaluator().evaluate(list(criteria), list(scenarios))
+        criterion_coverage = (
+            len(coverage.covered_criterion_ids) / coverage.criterion_count
+            if coverage.criterion_count
+            else 1.0
+        )
+        complete = sum(
+            bool(scenario.title.strip() and scenario.steps and scenario.expected_result.strip())
+            for scenario in scenarios
+        )
+        return ScenarioQuality(
+            scenario_count=len(scenarios),
+            scenario_count_score=min(len(scenarios) / 15, 1.0),
+            type_diversity=len(types & REQUIRED_SCENARIO_TYPES) / len(REQUIRED_SCENARIO_TYPES),
+            criterion_coverage=criterion_coverage,
+            complete_scenarios=complete,
+            total_scenarios=len(scenarios),
+        )
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\evaluators\traceability.py
+================================================================================
+# File: evaluation/evaluators/traceability.py
+# Description: Evaluates traceability coverage between acceptance criteria and QA scenarios.
+# Author Name: Debleena Nandy
+# Date: 2026-10-07
+# Time: 11:41:01 +05:30
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from core.models.requirement import AcceptanceCriterion
+from core.models.scenario import QAScenario
+
+
+@dataclass(frozen=True)
+class CriterionCoverage:
+    criterion_count: int
+    covered_criterion_ids: List[str]
+    uncovered_criterion_ids: List[str]
+    unknown_criterion_ids: List[str]
+
+
+class TraceabilityEvaluator:
+    """Measures criterion-to-scenario links and flags references to unknown criteria."""
+
+    def evaluate(
+        self,
+        criteria: List[AcceptanceCriterion],
+        scenarios: List[QAScenario],
+    ) -> CriterionCoverage:
+        expected_ids = {criterion.id for criterion in criteria}
+        linked_ids = {criterion_id for scenario in scenarios for criterion_id in scenario.criterion_ids}
+        covered = expected_ids & linked_ids
+        return CriterionCoverage(
+            criterion_count=len(expected_ids),
+            covered_criterion_ids=sorted(covered),
+            uncovered_criterion_ids=sorted(expected_ids - linked_ids),
+            unknown_criterion_ids=sorted(linked_ids - expected_ids),
+        )
+
+
+================================================================================
+FILE: C:\AI_Dev\portfolio\01-ai-qa-agent-platform\evaluation\reports\latest.json
+================================================================================
+{
+  "generated_at": "2026-10-07T07:43:24.544812+00:00",
+  "dataset": "evaluation/datasets/scenarios.json",
+  "cases": [
+    {
+      "id": "order-limit",
+      "domain": "e-commerce",
+      "generation_mode": "rule_based",
+      "metrics": {
+        "scenario_count": 15,
+        "scenario_count_score": 1.0,
+        "type_diversity": 1.0,
+        "criterion_coverage": 1.0,
+        "complete_scenarios": 15,
+        "total_scenarios": 15
+      },
+      "gates": {
+        "domain": true,
+        "scenario_count": true,
+        "type_diversity": true,
+        "criterion_coverage": true,
+        "scenario_completeness": true
+      }
+    }
+  ],
+  "passed": true,
+  "failures": []
+}
+

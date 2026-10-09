@@ -9,3 +9,5 @@ playwright==1.48.0
 langgraph==0.2.51
 python-dotenv==1.0.1
 ruff==0.6.9
+mypy==1.13.0
+types-requests>=2.32.0

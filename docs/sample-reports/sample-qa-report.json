@@ -1,0 +1,28 @@
+{
+  "plan_id": "PLAN-SYNTHETIC-SAMPLE",
+  "workflow_status": "completed",
+  "execution_status": "not_started",
+  "scenario_count": 16,
+  "criterion_count": 2,
+  "covered_criterion_ids": ["AC-001", "AC-002"],
+  "uncovered_criterion_ids": [],
+  "unknown_criterion_ids": [],
+  "execution_summary": {
+    "total_scenarios": 16,
+    "passed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "not_executed": 16
+  },
+  "failure_classification": "unknown",
+  "root_cause": {
+    "category": "unknown",
+    "hypothesis": "No scenario execution evidence is available; root cause cannot be assessed.",
+    "evidence": [],
+    "suggested_investigation": ["Configure an explicit test target and runner."],
+    "suggested_remediation": [],
+    "confidence": null,
+    "confidence_basis": "No tests were executed and no runner evidence was collected."
+  },
+  "recommendations": ["Review and approve the test plan before enabling execution."]
+}

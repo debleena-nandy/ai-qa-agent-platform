@@ -9,5 +9,8 @@ __pycache__/
 .coverage
 htmlcov/
 reports/
+artifacts/
+evaluation/reports/evaluation_*.json
+data/
 .vscode/
 .DS_Store

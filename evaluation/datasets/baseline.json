@@ -1,0 +1,6 @@
+{
+  "minimum_scenario_count": 8,
+  "minimum_type_diversity": 0.5,
+  "minimum_criterion_coverage": 1.0,
+  "minimum_complete_scenario_ratio": 1.0
+}

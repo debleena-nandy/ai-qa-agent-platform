@@ -1,0 +1,19 @@
+[
+  {
+    "id": "order-limit",
+    "requirement": "As a customer, I want to place an order to buy a toy so that I can receive it at home.\nAcceptance criteria:\n- Customer can order at most 5 units per toy\n- Out-of-stock toys cannot be ordered",
+    "expected_domain": "e-commerce",
+    "minimum_criterion_coverage": 1.0
+  },
+  {
+    "id": "secure-login",
+    "requirement": "As a customer, I want to log in to my account with my password so that my personal data stays private.\nAcceptance criteria:\n- Account is locked after 5 failed login attempts",
+    "expected_domain": "authentication",
+    "minimum_criterion_coverage": 1.0
+  },
+  {
+    "id": "profile-photo",
+    "requirement": "As a user, I want to upload a profile photo so that others recognise me.",
+    "expected_domain": "account-management"
+  }
+]
