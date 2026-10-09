@@ -14,3 +14,5 @@ evaluation/reports/evaluation_*.json
 data/
 .vscode/
 .DS_Store
+run_request.json
+run_response.json
